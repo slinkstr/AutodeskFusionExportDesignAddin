@@ -5,6 +5,6 @@
     "description": {
         "": "Export the active design in multiple formats (STEP, F3D, 3MF, etc.) with optional per-component export."
     },
-    "supportedOS": "windows|mac",
-    "editEnabled": true
+    "version": "1.0.1",
+    "supportedOS": "windows|mac"
 }
