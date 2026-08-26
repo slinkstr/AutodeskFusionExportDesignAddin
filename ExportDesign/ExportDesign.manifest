@@ -1,0 +1,10 @@
+{
+    "autodeskProduct": "Fusion",
+    "type": "addin",
+    "author": "slinkstr",
+    "description": {
+        "": "Export the active design in multiple formats (STEP, F3D, 3MF, etc.) with optional per-component export."
+    },
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
