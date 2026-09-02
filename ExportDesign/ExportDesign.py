@@ -1,18 +1,27 @@
 import adsk.core
 import adsk.fusion
 import copy
+import html
 import json
 import os
+import platform
 import re
+import subprocess
 import traceback
 
 _app      = None
 _ui       = None
 _handlers = []
 
+# Populated by the export command just before the results dialog is shown.
+_results_folder  = ""
+_results_summary = ""
+
 COMMAND_ID         = "ExportDesignFormats"
 COMMAND_NAME       = "Export Design"
 COMMAND_DESC       = "Export project and/or individual components in selected formats."
+RESULTS_COMMAND_ID = "ExportDesignResults"
+OPEN_FOLDER_INPUT  = "openExportFolder"
 TOOLBAR_TAB_ID     = "ToolsTab"
 TOOLBAR_PANEL_ID   = "ExportDesignPanel"
 TOOLBAR_PANEL_NAME = "Export"
@@ -49,6 +58,7 @@ DEFAULT_PREFS = {
     "exportComponents": True,
     "meshRefinement": "Medium",
     "overwrite": True,
+    "lastFolder": "",
 }
 
 # Maps format ID to a callable that creates export options.
@@ -212,6 +222,20 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 if checked:
                     selected_comp_formats.append((format_id, label, ext))
 
+            if not selected_formats and not (export_components and selected_comp_formats):
+                _ui.messageBox("No formats selected.")
+                return
+
+            # Prompt for output folder, starting from the last-used folder when available.
+            dlg = _ui.createFolderDialog()
+            dlg.title = "Select Export Folder"
+            last_folder = load_prefs().get("lastFolder", "")
+            if last_folder and os.path.isdir(last_folder):
+                dlg.initialDirectory = last_folder
+            if dlg.showDialog() != adsk.core.DialogResults.DialogOK:
+                return
+            output_folder = dlg.folder
+
             # Save preferences for next use.
             save_prefs({
                 "formats"         : format_prefs,
@@ -219,18 +243,8 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 "exportComponents": export_components,
                 "meshRefinement"  : refinement_name,
                 "overwrite"       : overwrite,
+                "lastFolder"      : output_folder,
             })
-
-            if not selected_formats and not (export_components and selected_comp_formats):
-                _ui.messageBox("No formats selected.")
-                return
-
-            # Prompt for output folder.
-            dlg = _ui.createFolderDialog()
-            dlg.title = "Select Export Folder"
-            if dlg.showDialog() != adsk.core.DialogResults.DialogOK:
-                return
-            output_folder = dlg.folder
 
             design = adsk.fusion.Design.cast(_app.activeProduct)
             project_name = _app.activeDocument.name
@@ -302,13 +316,60 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
 
             progress.hide()
 
-            msg = f"Exported {len(exported)} file(s) to:\n{output_folder}"
+            summary = f"Exported {len(exported)} file(s) to:<br/>{_html_escape(output_folder)}"
             if errors:
-                msg += f"\n\n{len(errors)} error(s):\n" + "\n".join(errors[:5])
-            _ui.messageBox(msg)
+                error_lines = "<br/>".join(_html_escape(e) for e in errors[:5])
+                summary += f"<br/><br/>{len(errors)} error(s):<br/>{error_lines}"
+
+            show_results_dialog(output_folder if exported else "", summary)
 
         except Exception:
             _ui.messageBox(f"Failed:\n{traceback.format_exc()}")
+
+class ResultsCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
+    def notify(self, args):
+        try:
+            cmd = args.command
+            cmd.isExecutedWhenPreEmpted = False
+
+            # Hide the default OK button; Cancel alone acts as "Close".
+            cmd.isOKButtonVisible = False
+
+            inputs = cmd.commandInputs
+            summary_box = inputs.addTextBoxCommandInput("resultsSummary", "", _results_summary, 6, True)
+            summary_box.isFullWidth = True
+
+            # Offer the open-folder action only when something was actually exported.
+            if _results_folder:
+                resource_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources")
+                open_button = inputs.addBoolValueInput(OPEN_FOLDER_INPUT, "Open export folder", False, resource_folder, False)
+                open_button.text = "Open export folder"
+
+            on_input_changed = ResultsInputChangedHandler()
+            cmd.inputChanged.add(on_input_changed)
+            _handlers.append(on_input_changed)
+        except Exception:
+            if _ui:
+                _ui.messageBox(f"Results dialog setup failed:\n{traceback.format_exc()}")
+
+class ResultsInputChangedHandler(adsk.core.InputChangedEventHandler):
+    def notify(self, args):
+        try:
+            if args.input.id == OPEN_FOLDER_INPUT and _results_folder:
+                open_in_file_browser(_results_folder)
+        except Exception:
+            if _ui:
+                _ui.messageBox(f"Open folder error:\n{traceback.format_exc()}")
+
+def show_results_dialog(folder, summary):
+    """Show the export results with an optional button that opens the output folder in the OS file browser."""
+    global _results_folder, _results_summary
+    _results_folder  = folder
+    _results_summary = summary
+
+    results_def = _ui.commandDefinitions.itemById(RESULTS_COMMAND_ID)
+    if results_def:
+        results_def.execute()
 
 def create_export_options(export_mgr, format_id, path, geometry, refinement):
     """Create the appropriate export options for a given format."""
@@ -319,6 +380,23 @@ def create_export_options(export_mgr, format_id, path, geometry, refinement):
 
 def sanitize_filename(name):
     return _INVALID_FILENAME_CHARS.sub("-", name)
+
+def _html_escape(text):
+    """Escape HTML metacharacters and convert newlines to <br/> for use in formattedText."""
+    return html.escape(text).replace("\n", "<br/>")
+
+def open_in_file_browser(folder):
+    """Open the given folder in the OS file browser, ignoring failures so a bad path never aborts the export."""
+    try:
+        system = platform.system()
+        if system == "Windows":
+            os.startfile(folder)
+        elif system == "Darwin":
+            subprocess.Popen(["open", folder])
+        else:
+            subprocess.Popen(["xdg-open", folder])
+    except Exception:
+        pass
 
 def unique_path(filepath):
     """Append a numeric suffix if the file already exists."""
@@ -349,6 +427,16 @@ def run(context):
         on_created = CommandCreatedHandler()
         cmd_def.commandCreated.add(on_created)
         _handlers.append(on_created)
+
+        # Register the results dialog command (shown after an export completes).
+        existing_results = cmd_defs.itemById(RESULTS_COMMAND_ID)
+        if existing_results:
+            existing_results.deleteMe()
+
+        results_def = cmd_defs.addButtonDefinition(RESULTS_COMMAND_ID, "Export Results", "Summary of the last export.")
+        on_results_created = ResultsCommandCreatedHandler()
+        results_def.commandCreated.add(on_results_created)
+        _handlers.append(on_results_created)
 
         # Add a button to a custom panel in the UTILITIES tab.
         tools_tab = _ui.allToolbarTabs.itemById(TOOLBAR_TAB_ID)
@@ -384,6 +472,10 @@ def stop(context):
         cmd_def = _ui.commandDefinitions.itemById(COMMAND_ID)
         if cmd_def:
             cmd_def.deleteMe()
+
+        results_def = _ui.commandDefinitions.itemById(RESULTS_COMMAND_ID)
+        if results_def:
+            results_def.deleteMe()
 
         _handlers.clear()
 
