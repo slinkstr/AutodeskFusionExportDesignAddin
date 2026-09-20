@@ -56,6 +56,7 @@ DEFAULT_PREFS = {
         "exportSTL": True
     },
     "exportComponents": True,
+    "includeHidden": True,
     "meshRefinement": "Medium",
     "overwrite": True,
     "lastFolder": "",
@@ -131,6 +132,9 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             comp_enabled = prefs.get("exportComponents", True)
             inputs.addBoolValueInput("exportComponents", "Export each component individually", True, "", comp_enabled)
 
+            include_hidden_input = inputs.addBoolValueInput("includeHidden", "Include hidden components", True, "", prefs.get("includeHidden", True))
+            include_hidden_input.tooltip = "Temporarily unhide hidden occurrences and bodies so exports include them."
+
             # Component format selection.
             comp_table = inputs.addTableCommandInput("compFormatTable", "Component Formats", 4, "1:3:1:3")
 
@@ -193,6 +197,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             inputs = args.command.commandInputs
 
             export_components = inputs.itemById("exportComponents").value
+            include_hidden    = inputs.itemById("includeHidden").value
             refinement_name   = inputs.itemById("meshRefinement").selectedItem.name
             overwrite         = inputs.itemById("overwrite").value
 
@@ -241,6 +246,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 "formats"         : format_prefs,
                 "componentFormats": comp_format_prefs,
                 "exportComponents": export_components,
+                "includeHidden"   : include_hidden,
                 "meshRefinement"  : refinement_name,
                 "overwrite"       : overwrite,
                 "lastFolder"      : output_folder,
@@ -252,12 +258,14 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             root = design.rootComponent
             exported = []
             errors = []
+            skipped = []
+
+            comp_exports = []
+            if export_components and selected_comp_formats:
+                comp_exports = exportable_occurrences(root, include_hidden, skipped)
 
             # Count total export operations for progress bar.
-            total_ops = len(selected_formats)
-            if export_components and selected_comp_formats:
-                comp_count = sum(1 for occ in root.allOccurrences if occ.component.bRepBodies.count > 0)
-                total_ops += comp_count * len(selected_comp_formats)
+            total_ops = len(selected_formats) + len(comp_exports) * len(selected_comp_formats)
 
             progress = _ui.createProgressDialog()
             progress.cancelButtonText = "Cancel"
@@ -269,54 +277,82 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             current_op = 0
 
             # Project-level exports.
-            for format_id, label, ext in selected_formats:
-                if progress.wasCancelled:
-                    break
-                try:
-                    path = os.path.join(output_folder, f"{project_name}.{ext}")
-                    if not overwrite:
-                        path = unique_path(path)
-                    opts = create_export_options(export_mgr, format_id, path, root, refinement)
-                    if opts:
-                        export_mgr.execute(opts)
-                        exported.append(os.path.basename(path))
-                except Exception:
-                    errors.append(f"{label} (project): {traceback.format_exc()}")
-                current_op += 1
-                progress.progressValue = current_op
-                progress.message = f"Exporting {current_op} of {total_ops}..."
-                adsk.doEvents()
-
-            # Per-component exports.
-            if export_components and selected_comp_formats and not progress.wasCancelled:
-                for occurrence in root.allOccurrences:
+            project_hidden = hidden_entities_in_design(root) if include_hidden else []
+            unhide_failures = set_entities_visible(project_hidden, True)
+            try:
+                for format_id, label, ext in selected_formats:
                     if progress.wasCancelled:
                         break
-                    if occurrence.component.bRepBodies.count == 0:
-                        continue
-                    comp_name = sanitize_filename(occurrence.name)
-                    for format_id, label, ext in selected_comp_formats:
-                        if progress.wasCancelled:
-                            break
-                        try:
-                            filename = f"{project_name}-{comp_name}.{ext}"
-                            path = os.path.join(output_folder, filename)
-                            if not overwrite:
-                                path = unique_path(path)
-                            opts = create_export_options(export_mgr, format_id, path, occurrence, refinement)
-                            if opts:
-                                export_mgr.execute(opts)
+                    try:
+                        path = os.path.join(output_folder, f"{project_name}.{ext}")
+                        if not overwrite:
+                            path = unique_path(path)
+                        opts = create_export_options(export_mgr, format_id, path, root, refinement)
+                        if opts:
+                            export_mgr.execute(opts)
+                            if os.path.exists(path):
                                 exported.append(os.path.basename(path))
-                        except Exception:
-                            errors.append(f"{label} ({occurrence.name}): {traceback.format_exc()}")
-                        current_op += 1
-                        progress.progressValue = current_op
-                        progress.message = f"Exporting {current_op} of {total_ops}..."
+                            else:
+                                hint = " (hidden geometry could not be unhidden)" if unhide_failures else ""
+                                errors.append(f"{label} (project): exporter produced no file{hint}")
+                    except Exception:
+                        errors.append(f"{label} (project): {traceback.format_exc()}")
+                    current_op += 1
+                    progress.progressValue = current_op
+                    progress.message = f"Exporting {current_op} of {total_ops}..."
+                    adsk.doEvents()
+            finally:
+                set_entities_visible(project_hidden, False)
+
+            # Per-component exports.
+            if comp_exports and not progress.wasCancelled:
+                for occurrence, hidden in comp_exports:
+                    if progress.wasCancelled:
+                        break
+                    comp_name = sanitize_filename(occurrence.name)
+                    unhide_failures = set_entities_visible(hidden, True)
+                    if hidden:
                         adsk.doEvents()
+                    try:
+                        if not occurrence.isVisible:
+                            errors.append(f"{occurrence.name}: could not be made visible for export")
+                            continue
+                        for format_id, label, ext in selected_comp_formats:
+                            if progress.wasCancelled:
+                                break
+                            try:
+                                filename = f"{project_name}-{comp_name}.{ext}"
+                                path = os.path.join(output_folder, filename)
+                                if not overwrite:
+                                    path = unique_path(path)
+                                opts = create_export_options(export_mgr, format_id, path, occurrence, refinement)
+                                if opts:
+                                    export_mgr.execute(opts)
+                                    if os.path.exists(path):
+                                        exported.append(os.path.basename(path))
+                                    else:
+                                        hints = []
+                                        if unhide_failures:
+                                            hints.append("hidden geometry could not be unhidden")
+                                        if mesh_body_count(occurrence.component) > 0:
+                                            hints.append("component contains mesh bodies, which this format ignores")
+                                        detail = f" ({'; '.join(hints)})" if hints else ""
+                                        errors.append(f"{label} ({occurrence.name}): exporter produced no file{detail}")
+                            except Exception:
+                                errors.append(f"{label} ({occurrence.name}): {traceback.format_exc()}")
+                            current_op += 1
+                            progress.progressValue = current_op
+                            progress.message = f"Exporting {current_op} of {total_ops}..."
+                            adsk.doEvents()
+                    finally:
+                        set_entities_visible(hidden, False)
 
             progress.hide()
 
             summary = f"Exported {len(exported)} file(s) to:<br/>{_html_escape(output_folder)}"
+            if skipped:
+                skipped_lines = "<br/>".join(_html_escape(s) for s in skipped[:5])
+                summary += f"<br/><br/>Skipped {len(skipped)} component(s):<br/>{skipped_lines}"
             if errors:
                 error_lines = "<br/>".join(_html_escape(e) for e in errors[:5])
                 summary += f"<br/><br/>{len(errors)} error(s):<br/>{error_lines}"
@@ -380,6 +416,78 @@ def create_export_options(export_mgr, format_id, path, geometry, refinement):
 
 def sanitize_filename(name):
     return _INVALID_FILENAME_CHARS.sub("-", name)
+
+def hidden_entities(occurrence):
+    """Hidden ancestors and bodies whose visibility an export of this occurrence depends on."""
+    hidden = []
+    occ = occurrence
+    while occ is not None:
+        if not occ.isLightBulbOn:
+            hidden.append((occ, "isLightBulbOn"))
+        occ = occ.assemblyContext
+    for body in occurrence.bRepBodies:
+        if not body.isVisible:
+            hidden.append((body, "isVisible"))
+    return hidden
+
+def hidden_entities_in_design(root):
+    """All hidden occurrences and bodies in the design."""
+    hidden = []
+    seen = set()
+    for occurrence in root.allOccurrences:
+        for entity, attr in hidden_entities(occurrence):
+            if attr == "isLightBulbOn":
+                if entity.entityToken in seen:
+                    continue
+                seen.add(entity.entityToken)
+            hidden.append((entity, attr))
+    for body in root.bRepBodies:
+        if not body.isVisible:
+            hidden.append((body, "isVisible"))
+    return hidden
+
+def set_entities_visible(entities, visible):
+    """Set visibility on (entity, attribute) pairs, returning entities that could not be changed."""
+    failed = []
+    for entity, attr in entities:
+        try:
+            setattr(entity, attr, visible)
+        except Exception:
+            failed.append(entity)
+    return failed
+
+def mesh_body_count(component):
+    mesh_bodies = getattr(component, "meshBodies", None)
+    return mesh_bodies.count if mesh_bodies is not None else 0
+
+def is_chain_suppressed(occurrence):
+    occ = occurrence
+    while occ is not None:
+        if getattr(occ, "isSuppressed", False):
+            return True
+        occ = occ.assemblyContext
+    return False
+
+def exportable_occurrences(root, include_hidden, skipped):
+    """Occurrences to attempt component exports for; the rest are recorded in skipped."""
+    result = []
+    for occurrence in root.allOccurrences:
+        if occurrence.component.bRepBodies.count == 0:
+            reason = "mesh bodies only" if mesh_body_count(occurrence.component) > 0 else "no bodies"
+            skipped.append(f"{occurrence.name} ({reason})")
+            continue
+        if is_chain_suppressed(occurrence):
+            skipped.append(f"{occurrence.name} (suppressed)")
+            continue
+        hidden = hidden_entities(occurrence)
+        if not occurrence.isVisible and not hidden:
+            skipped.append(f"{occurrence.name} (not visible)")
+            continue
+        if hidden and not include_hidden:
+            skipped.append(f"{occurrence.name} (hidden)")
+            continue
+        result.append((occurrence, hidden))
+    return result
 
 def _html_escape(text):
     """Escape HTML metacharacters and convert newlines to <br/> for use in formattedText."""
